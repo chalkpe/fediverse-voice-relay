@@ -12,7 +12,7 @@ jobs:
           POSTGRES_PASSWORD: voice-relay-test-only
           POSTGRES_DB: voice-relay
         ports: ['17832:5432']
-        options: --health-cmd 'pg_isready -U voice-relay' --health-interval 5s --health-timeout 3s --health-retries 10
+        options: --health-cmd "pg_isready -U voice-relay" --health-interval 5s --health-timeout 3s --health-retries 10
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: pnpm/action-setup@v6.1.1

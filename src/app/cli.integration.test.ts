@@ -19,133 +19,240 @@ import { loadConfig } from './config.ts'
 import { createServer } from './server.ts'
 
 const exec = promisify(execFile)
+const ioTimeout = 8000
+const lifecycleTimeout = 25000
 
-test('CLI issues one-time credentials and supports enable, rotate and revoke without listing keys', async () => {
+type Credential = { origin: string; secret: string }
+type ListedClient = { origin: string; allow_screen_share: boolean; enabled: boolean }
+
+async function withCliFixture(
+  run: (fixture: {
+    cli: (...args: string[]) => Promise<string>
+    add: (origin?: string, allowScreenShare?: boolean) => Promise<Credential>
+    database: Awaited<ReturnType<typeof createTestDatabase>>
+    config: string
+    keyfile: string
+  }) => Promise<void>,
+) {
   const base = process.env.VOICE_RELAY_TEST_DATABASE_URL ?? 'postgres://voice-relay:voice-relay-test-only@127.0.0.1:17832/voice-relay'
   const database = await createTestDatabase({ connectionString: base, migrate: false })
-  const schema = database.schema
-  const dir = await mkdtemp(join(tmpdir(), 'voice-relay-cli-'))
-  const file = join(dir, 'config.json')
-  const keyfile = join(dir, 'keys.json')
-  const url = new URL(base)
-  url.searchParams.set('options', `-c search_path=${schema}`)
-  await writeFile(keyfile, '{}', { mode: 0o600 })
-  await writeFile(
-    file,
-    JSON.stringify({
-      databaseUrl: url.href,
-      publicUrl: 'https://relay.test',
-      clientSecretFile: keyfile,
-      maxSlots: 102,
-      maxRooms: 2,
-      livekit: testLiveKitSettings,
-    }),
-    { mode: 0o600 },
-  )
-  const cli = async (...args: string[]) =>
-    JSON.parse(
+  let dir: string | undefined
+  try {
+    dir = await mkdtemp(join(tmpdir(), 'voice-relay-cli-'))
+    const config = join(dir, 'config.json')
+    const keyfile = join(dir, 'keys.json')
+    const url = new URL(base)
+    url.searchParams.set('options', `-c search_path=${database.schema}`)
+    await writeFile(keyfile, '{}', { mode: 0o600 })
+    await writeFile(
+      config,
+      JSON.stringify({
+        databaseUrl: url.href,
+        publicUrl: 'https://relay.test',
+        clientSecretFile: keyfile,
+        maxSlots: 102,
+        maxRooms: 2,
+        livekit: testLiveKitSettings,
+      }),
+      { mode: 0o600 },
+    )
+    const cli = async (...args: string[]) =>
       (
         await exec('node', ['src/app/cli.ts', 'client', ...args], {
-          env: { ...process.env, VOICE_RELAY_CONFIG: file },
+          env: { ...process.env, VOICE_RELAY_CONFIG: config },
+          timeout: ioTimeout,
+          killSignal: 'SIGKILL',
         })
-      ).stdout,
-    )
-  try {
-    const created = await cli('add', '--origin', 'https://consumer.test', '--max-slots', '102', '--max-rooms', '2', '--allow-screen-share')
-    expect(created.secret.length).toBe(64)
-    expect(Object.keys(created).sort()).toEqual(['origin', 'secret'])
-    expect(created.origin).toBe('https://consumer.test')
-    await expect(cli('add', '--origin', 'https://CONSUMER.test:443', '--max-slots', '1', '--max-rooms', '1')).rejects.toThrow(
-      'Client origin already registered',
-    )
-
-    const connection = database.connect()
-    const store = connection.store
-    const clientId = (await store.clientByOrigin(created.origin))?.id
-    if (!clientId) throw new Error('Client missing')
-    const livekitConfig = testLiveKit
-    const app = await createServer({ ...loadConfig(file), livekit: livekitConfig }, { store, startWorkers: false })
-    const livekit = new LiveKit(livekitConfig)
-    const provider = new Provider(store, livekit, { maxSlots: 102, maxRooms: 2, mediaProvider: 'https://relay.test', iceServers: null })
-    let room: Awaited<ReturnType<typeof provider.allocate>> | undefined
-    try {
-      await new Promise<void>((resolve) => app.server.listen(0, '127.0.0.1', resolve))
-      const port = (app.server.address() as AddressInfo).port
-      let activeCredential = created
-      const capacity = async (credential = activeCredential) => {
-        const path = '/voice-relay/v1/capacity'
-        return fetch(`http://127.0.0.1:${port}${path}`, {
-          headers: {
-            authorization: `Bearer ${await clientToken(credential.secret, credential.origin)}`,
-          },
-        })
-      }
-      const active = await capacity()
-      expect(active.status).toBe(200)
-      expect((await active.json()).accepting).toBe(true)
-      room = await provider.allocate(clientId, { roomKey: `cli-${randomUUID()}`, generation: 'g', slots: 1 })
-      const token = await provider.join(clientId, room.id, { identity: 'cli-user', userId: 'cli-user', allowScreenShare: false })
-      const liveRotation = await cli('rotate-secret', '--origin', created.origin)
-      expect((await capacity(created)).status).toBe(401)
-      expect((await capacity(liveRotation)).status).toBe(200)
-      expect((await provider.snapshot(clientId, room.id)).state).toBe('active')
-      expect((await provider.inspect(clientId, token.token)).allocationId).toBe(room.id)
-      activeCredential = liveRotation
-      await exec('node', ['src/app/cli.ts', 'client', 'disable', '--origin', created.origin], {
-        env: { ...process.env, VOICE_RELAY_CONFIG: file },
-      })
-      const revoked = await capacity()
-      expect(revoked.status).toBe(200)
-      expect((await revoked.json()).accepting).toBe(false)
-      await expect(provider.inspect(clientId, token.token)).rejects.toMatchObject({ code: 'CLIENT_DISABLED' })
-      await expect(provider.renew(clientId, room.id)).rejects.toMatchObject({ code: 'CLIENT_DISABLED' })
-      const cancelled = await fetch(`http://127.0.0.1:${port}/voice-relay/v1/allocations/cancel`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${await clientToken(activeCredential.secret, activeCredential.origin)}`,
-        },
-        body: JSON.stringify({ roomKey: room.roomKey, generation: room.generation }),
-      })
-      expect(cancelled.status).toBe(200)
-      expect(await cancelled.json()).toEqual({ state: 'ended' })
-      await provider.sweep(false)
-      expect((await provider.snapshot(clientId, room.id)).state).toBe('ended')
-      expect(await livekit.client.listRooms([roomName(room)])).toHaveLength(0)
-      expect((await provider.events(clientId)).events.some((event) => event.allocationId === room?.id && event.type === 'ended')).toBe(true)
-      await exec('node', ['src/app/cli.ts', 'client', 'enable', '--origin', created.origin], {
-        env: { ...process.env, VOICE_RELAY_CONFIG: file },
-      })
-      const reenabled = await capacity()
-      expect(reenabled.status).toBe(200)
-      expect((await reenabled.json()).accepting).toBe(true)
-    } finally {
-      if (room) await provider.end(clientId, room.id).catch(() => {})
-      await app.close()
-      await connection.close()
-    }
-
-    const withoutSharing = await cli('add', '--origin', 'https://no-sharing.example.org', '--max-slots', '1', '--max-rooms', '1')
-    const listed = await cli('list')
-    expect(listed.find((client: { origin: string }) => client.origin === withoutSharing.origin).allow_screen_share).toBe(false)
-    expect(listed.find((client: { origin: string }) => client.origin === created.origin).allow_screen_share).toBe(true)
-    expect(JSON.stringify(listed).includes(created.secret)).toBe(false)
-    expect(listed.find((client: { origin: string }) => client.origin === created.origin).enabled).toBe(true)
-
-    const rotated = await cli('rotate-secret', '--origin', created.origin)
-    expect(rotated.secret !== created.secret).toBe(true)
-    const secrets = JSON.parse(await readFile(keyfile, 'utf8'))
-    expect(secrets[clientId]).toBe(rotated.secret)
-
-    await exec('node', ['src/app/cli.ts', 'client', 'disable', '--origin', created.origin], {
-      env: { ...process.env, VOICE_RELAY_CONFIG: file },
-    })
-    expect((await cli('list')).find((client: { origin: string }) => client.origin === created.origin).enabled).toBe(false)
+      ).stdout
+    const add = async (origin = 'https://consumer.test', allowScreenShare = false): Promise<Credential> =>
+      JSON.parse(
+        await cli(
+          'add',
+          '--origin',
+          origin,
+          '--max-slots',
+          '102',
+          '--max-rooms',
+          '2',
+          ...(allowScreenShare ? ['--allow-screen-share'] : []),
+        ),
+      )
+    await run({ cli, add, database, config, keyfile })
   } finally {
-    await database.close()
-    await rm(dir, { recursive: true })
+    try {
+      await database.close()
+    } finally {
+      if (dir) await rm(dir, { recursive: true, force: true })
+    }
   }
-})
+}
+
+async function withLiveClient(
+  fixture: { database: Awaited<ReturnType<typeof createTestDatabase>>; config: string },
+  credential: Credential,
+  run: (live: {
+    clientId: string
+    provider: Provider
+    livekit: LiveKit
+    room: Awaited<ReturnType<Provider['allocate']>>
+    token: Awaited<ReturnType<Provider['join']>>
+    capacity: (credential: Credential) => Promise<Response>
+    cancel: (credential: Credential) => Promise<Response>
+  }) => Promise<void>,
+) {
+  const connection = fixture.database.connect()
+  let app: Awaited<ReturnType<typeof createServer>> | undefined
+  let room: Awaited<ReturnType<Provider['allocate']>> | undefined
+  let provider: Provider | undefined
+  let clientId: string | undefined
+  try {
+    clientId = (await connection.store.clientByOrigin(credential.origin))?.id
+    if (!clientId) throw new Error('Client missing')
+    app = await createServer({ ...loadConfig(fixture.config), livekit: testLiveKit }, { store: connection.store, startWorkers: false })
+    const livekit = new LiveKit(testLiveKit)
+    provider = new Provider(connection.store, livekit, {
+      maxSlots: 102,
+      maxRooms: 2,
+      mediaProvider: 'https://relay.test',
+      iceServers: null,
+    })
+    await new Promise<void>((resolve, reject) => {
+      app?.server.once('error', reject)
+      app?.server.listen(0, '127.0.0.1', resolve)
+    })
+    const port = (app.server.address() as AddressInfo).port
+    room = await provider.allocate(clientId, { roomKey: `cli-${randomUUID()}`, generation: 'g', slots: 1 })
+    const token = await provider.join(clientId, room.id, { identity: 'cli-user', userId: 'cli-user', allowScreenShare: false })
+    const request = async (path: string, current: Credential, body?: object) =>
+      fetch(`http://127.0.0.1:${port}${path}`, {
+        method: body ? 'POST' : 'GET',
+        headers: {
+          authorization: `Bearer ${await clientToken(current.secret, current.origin)}`,
+          ...(body ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        signal: AbortSignal.timeout(ioTimeout),
+      })
+    const capacity = (current: Credential) => request('/voice-relay/v1/capacity', current)
+    const cancel = (current: Credential) =>
+      request('/voice-relay/v1/allocations/cancel', current, { roomKey: room?.roomKey, generation: room?.generation })
+    await run({ clientId, provider, livekit, room, token, capacity, cancel })
+  } finally {
+    try {
+      if (room && provider && clientId) await provider.end(clientId, room.id)
+    } finally {
+      try {
+        await app?.close()
+      } finally {
+        await connection.close()
+      }
+    }
+  }
+}
+
+test(
+  'CLI issues one-time credentials and rejects a duplicate origin',
+  async () => {
+    await withCliFixture(async ({ add }) => {
+      const created = await add('https://consumer.test', true)
+
+      expect(created.secret.length).toBe(64)
+      expect(Object.keys(created).sort()).toEqual(['origin', 'secret'])
+      expect(created.origin).toBe('https://consumer.test')
+      await expect(add('https://CONSUMER.test:443')).rejects.toThrow('Client origin already registered')
+    })
+  },
+  lifecycleTimeout,
+)
+
+test(
+  'CLI lists permissions and enabled state without exposing secrets',
+  async () => {
+    await withCliFixture(async ({ cli, add }) => {
+      const created = await add('https://consumer.test', true)
+      const withoutSharing = await add('https://no-sharing.example.org')
+      const listed: ListedClient[] = JSON.parse(await cli('list'))
+
+      expect(listed.find((client) => client.origin === withoutSharing.origin)?.allow_screen_share).toBe(false)
+      expect(listed.find((client) => client.origin === created.origin)?.allow_screen_share).toBe(true)
+      expect(listed.find((client) => client.origin === created.origin)?.enabled).toBe(true)
+      expect(JSON.stringify(listed)).not.toContain(created.secret)
+      expect(JSON.stringify(listed)).not.toContain(withoutSharing.secret)
+    })
+  },
+  lifecycleTimeout,
+)
+
+test(
+  'CLI rotates credentials while an active allocation remains usable',
+  async () => {
+    await withCliFixture(async (fixture) => {
+      const created = await fixture.add()
+      await withLiveClient(fixture, created, async ({ clientId, provider, room, token, capacity }) => {
+        const active = await capacity(created)
+        expect(active.status).toBe(200)
+        expect((await active.json()).accepting).toBe(true)
+
+        const rotated: Credential = JSON.parse(await fixture.cli('rotate-secret', '--origin', created.origin))
+        expect(rotated.secret).not.toBe(created.secret)
+        expect(JSON.parse(await readFile(fixture.keyfile, 'utf8'))[clientId]).toBe(rotated.secret)
+        expect((await capacity(created)).status).toBe(401)
+        expect((await capacity(rotated)).status).toBe(200)
+        expect((await provider.snapshot(clientId, room.id)).state).toBe('active')
+        expect((await provider.inspect(clientId, token.token)).allocationId).toBe(room.id)
+      })
+    })
+  },
+  lifecycleTimeout,
+)
+
+test(
+  'CLI disables a client while allowing cancellation of its allocation',
+  async () => {
+    await withCliFixture(async (fixture) => {
+      const created = await fixture.add()
+      await withLiveClient(fixture, created, async ({ clientId, provider, livekit, room, token, capacity, cancel }) => {
+        await fixture.cli('disable', '--origin', created.origin)
+
+        const revoked = await capacity(created)
+        expect(revoked.status).toBe(200)
+        expect((await revoked.json()).accepting).toBe(false)
+        await expect(provider.inspect(clientId, token.token)).rejects.toMatchObject({ code: 'CLIENT_DISABLED' })
+        await expect(provider.renew(clientId, room.id)).rejects.toMatchObject({ code: 'CLIENT_DISABLED' })
+        const cancelled = await cancel(created)
+        expect(cancelled.status).toBe(200)
+        expect(await cancelled.json()).toEqual({ state: 'ended' })
+        await provider.sweep(false)
+        expect((await provider.snapshot(clientId, room.id)).state).toBe('ended')
+        expect(await livekit.client.listRooms([roomName(room)])).toHaveLength(0)
+        expect((await provider.events(clientId)).events.some((event) => event.allocationId === room.id && event.type === 'ended')).toBe(
+          true,
+        )
+        const listed: ListedClient[] = JSON.parse(await fixture.cli('list'))
+        expect(listed.find((client) => client.origin === created.origin)?.enabled).toBe(false)
+      })
+    })
+  },
+  lifecycleTimeout,
+)
+
+test(
+  'CLI enables a disabled client again',
+  async () => {
+    await withCliFixture(async (fixture) => {
+      const created = await fixture.add()
+      await fixture.cli('disable', '--origin', created.origin)
+      await fixture.cli('enable', '--origin', created.origin)
+
+      await withLiveClient(fixture, created, async ({ capacity }) => {
+        const reenabled = await capacity(created)
+        expect(reenabled.status).toBe(200)
+        expect((await reenabled.json()).accepting).toBe(true)
+      })
+    })
+  },
+  lifecycleTimeout,
+)
 
 test('concurrent CLI processes preserve creations and rotations and recover failed creates', async () => {
   const { spawn } = await import('node:child_process')

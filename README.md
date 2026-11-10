@@ -4,7 +4,6 @@
 
 <h1 align="center">Voice relay for the fediverse</h1>
 
-<p align="center"><sub>아이콘 그림: Chalk</sub></p>
 
 연합우주 서버의 음성 통화와 화면 공유를 위한 LiveKit 릴레이입니다. 이용 서버는 릴레이 주소와 발급받은 시크릿을 등록해 연결합니다.
 

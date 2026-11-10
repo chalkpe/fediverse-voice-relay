@@ -4,7 +4,6 @@
 
 <h1 align="center">Voice relay for the fediverse</h1>
 
-
 연합우주 서버의 음성 통화와 화면 공유를 위한 LiveKit 릴레이입니다. 이용 서버는 릴레이 주소와 발급받은 시크릿을 등록해 연결합니다.
 
 이용 서버는 릴레이 API로 통화를 관리하고, 브라우저의 음성과 화면 공유는 LiveKit으로 연결됩니다.
@@ -19,7 +18,7 @@ docker compose pull
 docker compose up -d
 ```
 
-`--public-url`에는 운영할 릴레이의 공개 HTTPS 주소를 입력하세요. `init`은 `.env`와 `secrets/`에 비밀번호와 LiveKit 키를 생성합니다. 이미 설정 파일이 있으면 덮어쓰지 않습니다. 전체 최대 참가자 수와 방 수는 필요할 때 `secrets/config.json`의 `maxSlots`, `maxRooms`에서 조정하세요.
+`--public-url`에는 운영할 릴레이의 공개 HTTPS 주소를 입력하세요. `init`은 `.env`와 `secrets/`에 비밀번호와 LiveKit 키를 생성합니다. 이미 설정 파일이 있으면 덮어쓰지 않습니다. 릴레이 전체의 최대 슬롯 수와 방 수는 필요할 때 `secrets/config.json`의 `maxSlots`, `maxRooms`에서 조정하세요.
 
 화면 공유 화질 상한은 `screenShareLimits`로 조정할 수 있습니다. 설정과 적용 시점은 [운영 문서](docs/operations.md)를 참고하세요.
 
@@ -33,6 +32,8 @@ docker compose run --rm admin client list
 ```
 
 `client add` 결과에서 이용 서버의 `origin`과 발급된 `secret`을 확인하세요. 해당 이용 서버 관리자에게 릴레이 주소와 시크릿을 전달하세요. [이용 서버 연결 방법](docs/cherrypick.md)을 참고하세요.
+
+`--max-slots`는 이 이용 서버가 여러 방에서 함께 쓸 수 있는 슬롯 수이고, `--max-rooms`는 동시에 열 수 있는 방 수입니다. 릴레이는 한 통화가 시작될 때 그 방의 최대 참가자 수만큼 슬롯을 예약합니다. [운영 문서의 용량](docs/operations.md#용량)에서 슬롯을 정하는 기준을 확인하세요.
 
 ## 시크릿 교체와 회수
 

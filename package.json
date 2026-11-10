@@ -1,0 +1,46 @@
+{
+  "name": "fediverse-voice-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=26.12.1 <27"
+  },
+  "packageManager": "pnpm@12.14.0",
+  "scripts": {
+    "test": "vitest run src --exclude '**/*.integration.test.ts'",
+    "test:integration": "vitest run .integration.test.ts",
+    "test:contract": "vitest run src/relay/protocol.test.ts src/relay/bearer-auth.test.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "start": "node src/app/server.ts",
+    "cli": "node src/app/cli.ts",
+    "format": "biome check --write ."
+  },
+  "dependencies": {
+    "@hono/node-server": "2.1.6",
+    "@hono/swagger-ui": "0.6.2",
+    "@hono/zod-openapi": "1.6.3",
+    "@prometheus-io/client": "0.16.1",
+    "drizzle-orm": "0.45.4",
+    "hono": "4.13.16",
+    "jose": "6.2.16",
+    "livekit-server-sdk": "2.19.1",
+    "pg": "8.23.1",
+    "ws": "8.22.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@livekit/protocol": "1.52.1",
+    "@seriousme/openapi-schema-validator": "2.11.0",
+    "@types/node": "26.6.5",
+    "@types/pg": "8.23.1",
+    "@types/ws": "8.18.2",
+    "drizzle-kit": "0.31.11",
+    "livekit-client": "2.23.0",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  }
+}

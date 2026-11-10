@@ -1,0 +1,45 @@
+name: test
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: voice-relay
+          POSTGRES_PASSWORD: voice-relay-test-only
+          POSTGRES_DB: voice-relay
+        ports: ['17832:5432']
+        options: --health-cmd 'pg_isready -U voice-relay' --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v6.1.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Configure test LiveKit credentials
+        run: |
+          umask 077
+          secret="$(openssl rand -hex 32)"
+          refresh_secret="$(openssl rand -hex 32)"
+          printf 'port: 7880\nkeys:\n  ci-test-key: %s\n' "$secret" > "$RUNNER_TEMP/livekit.yaml"
+          printf 'port: 7880\nkeys:\n  ci-refresh-key: %s\n  ci-test-key: %s\n' "$refresh_secret" "$secret" > "$RUNNER_TEMP/livekit-multi.yaml"
+          printf 'LIVEKIT_URL=http://127.0.0.1:17880\nLIVEKIT_API_KEY=ci-test-key\nLIVEKIT_API_SECRET=%s\nLIVEKIT_REFRESH_API_KEY=ci-refresh-key\nLIVEKIT_REFRESH_API_SECRET=%s\n' "$secret" "$refresh_secret" >> "$GITHUB_ENV"
+          chmod 600 "$GITHUB_ENV"
+          docker run -d --name voice-relay-test-sfu -p 127.0.0.1:17880:7880 -v "$RUNNER_TEMP/livekit.yaml:/etc/livekit.yaml:ro" livekit/livekit-server:v1.13.11 --config /etc/livekit.yaml
+          curl --fail --silent --retry 30 --retry-connrefused --retry-delay 1 http://127.0.0.1:17880/ >/dev/null
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: NODE_ENV=production pnpm test
+      - run: NODE_ENV=production pnpm test:contract
+      - run: NODE_ENV=production pnpm test:integration --no-file-parallelism --exclude src/app/key-rotation.integration.test.ts
+      - run: |
+          docker rm -f voice-relay-test-sfu
+          docker run -d --name voice-relay-test-sfu -p 127.0.0.1:17880:7880 -v "$RUNNER_TEMP/livekit-multi.yaml:/etc/livekit.yaml:ro" livekit/livekit-server:v1.13.11 --config /etc/livekit.yaml
+          curl --fail --silent --retry 30 --retry-connrefused --retry-delay 1 http://127.0.0.1:17880/ >/dev/null
+          NODE_ENV=production pnpm exec vitest run src/app/key-rotation.integration.test.ts --no-file-parallelism
+      - run: docker build --build-arg NODE_VERSION="$(cat .nvmrc)" -t voice-relay-ci .

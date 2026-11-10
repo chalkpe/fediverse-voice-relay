@@ -1,0 +1,96 @@
+services:
+  config-init:
+    image: ghcr.io/chalkpe/fediverse-voice-relay:latest
+    user: root
+    entrypoint: ['sh', '-ec']
+    command:
+      - |
+        install -d -m 0700 -o node -g node /output
+        install -d -m 0700 -o node -g node /livekit-output
+        install -d -m 0700 -o node -g node /control
+        tmp=$$(mktemp /output/.config.XXXXXX)
+        install -m 0600 -o node -g node /input/config.json "$$tmp"
+        mv -f "$$tmp" /output/config.json
+        tmp=$$(mktemp /livekit-output/.config.XXXXXX)
+        install -m 0600 -o node -g node /input/livekit.yaml "$$tmp"
+        mv -f "$$tmp" /livekit-output/livekit.yaml
+        rm -f /output/livekit.yaml
+    volumes:
+      - ./secrets:/input:ro
+      - relay-config:/output
+      - livekit-config:/livekit-output
+      - relay-control:/control
+
+  relay:
+    image: ghcr.io/chalkpe/fediverse-voice-relay:latest
+    restart: unless-stopped
+    environment:
+      VOICE_RELAY_CONFIG: /run/relay-config/config.json
+      VOICE_RELAY_CONTROL: /run/relay-control/relay.sock
+    volumes:
+      - relay-config:/run/relay-config:ro
+      - relay-keys:/run/relay-keys:ro
+      - relay-control:/run/relay-control
+    ports:
+      - '127.0.0.1:7888:7888'
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+
+  admin:
+    profiles: ['admin']
+    image: ghcr.io/chalkpe/fediverse-voice-relay:latest
+    entrypoint: ['node', 'src/app/cli.ts']
+    command: ['--help']
+    environment:
+      VOICE_RELAY_CONFIG: /run/relay-config/config.json
+      VOICE_RELAY_CONTROL: /run/relay-control/relay.sock
+    volumes:
+      - relay-config:/run/relay-config:ro
+      - relay-keys:/run/relay-keys
+      - relay-control:/run/relay-control
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: voice-relay
+      POSTGRES_USER: voice-relay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - database:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'voice-relay', '-d', 'voice-relay']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  livekit:
+    image: livekit/livekit-server:v1.13.11
+    restart: unless-stopped
+    command: ['--config', '/run/livekit-config/livekit.yaml']
+    volumes:
+      - livekit-config:/run/livekit-config:ro
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+    ports:
+      - '7881:7881/tcp'
+      - '7882:7882/udp'
+      # TURN을 사용하면 3478/UDP와 5349/TCP를 추가로 열 수 있습니다.
+
+volumes:
+  relay-config:
+  livekit-config:
+  relay-keys:
+  relay-control:
+  database:

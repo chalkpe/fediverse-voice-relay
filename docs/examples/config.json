@@ -1,0 +1,22 @@
+{
+  "databaseUrl": "postgres://voice-relay:REPLACE_DB_PASSWORD@db:5432/voice-relay",
+  "host": "0.0.0.0",
+  "metrics": { "host": "0.0.0.0", "port": 9090 },
+  "port": 7888,
+  "publicUrl": "https://voice.example.org",
+  "clientSecretFile": "/run/relay-keys/clients.json",
+  "cloudflareTurn": null,
+  "livekit": {
+    "url": "http://livekit:7880",
+    "apiKey": "CHANGE_ME",
+    "apiSecret": "CHANGE_ME"
+  },
+  "maxSlots": 100,
+  "maxRooms": 10,
+  "screenShareLimits": {
+    "maxWidth": 1920,
+    "maxHeight": 1080,
+    "maxFrameRate": 60,
+    "maxBitrate": 8000000
+  }
+}

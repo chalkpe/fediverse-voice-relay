@@ -1,0 +1,13 @@
+.git
+node_modules
+dist
+secrets
+.env
+*.log
+
+**/*.test.ts
+src/relay/fixtures
+src/app/fixtures
+src/infra/test-*.ts
+
+/config.json

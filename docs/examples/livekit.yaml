@@ -1,0 +1,13 @@
+port: 7880
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  use_external_ip: true
+keys:
+  CHANGE_ME: CHANGE_ME
+webhook:
+  api_key: CHANGE_ME
+  urls:
+    - http://relay:7888/livekit/webhook
+# 필요한 경우 LiveKit 내장 TURN 또는 별도 TURN 서비스를 설정하세요.
+# 공개 URL과 단기 자격 증명은 릴레이의 iceServers에 설정하세요.

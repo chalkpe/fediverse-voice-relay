@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { readFileSync } from 'node:fs'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { isIP } from 'node:net'
 import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
@@ -28,26 +28,16 @@ export function loadSecrets(file: string): Record<string, string> {
 }
 
 export function secretLoader(file: string): () => Promise<Record<string, string>> {
-  let fingerprint = ''
+  let cachedRaw: string | undefined
   let cache: Record<string, string> | undefined
-  let pending: { fingerprint: string; promise: Promise<Record<string, string>> } | undefined
   return async () => {
-    const info = await stat(file)
-    const current = `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`
-    if (cache && fingerprint === current) return cache
-    if (pending?.fingerprint === current) return pending.promise
-    const promise = readFile(file, 'utf8').then((raw) => {
-      const parsed = parseJson(raw, 'secret file') as Record<string, string>
-      fingerprint = current
-      cache = parsed
-      return parsed
-    })
-    pending = { fingerprint: current, promise }
-    try {
-      return await promise
-    } finally {
-      if (pending?.promise === promise) pending = undefined
-    }
+    // 파일 크기와 시각이 같아도 내용이 바뀔 수 있으므로 실제 바이트를 확인합니다.
+    const raw = await readFile(file, 'utf8')
+    if (cache && cachedRaw === raw) return cache
+    const parsed = parseJson(raw, 'secret file') as Record<string, string>
+    cachedRaw = raw
+    cache = parsed
+    return parsed
   }
 }
 

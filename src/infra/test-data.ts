@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { eq } from 'drizzle-orm'
-import { allocations, clientGenerationUsage, clientRequestLimits, clients, events } from './schema.ts'
+import { allocations, clientGenerationUsage, clientRequestLimits, clients, events, participantTokens } from './schema.ts'
 import type { Store } from './store.ts'
 
 export async function expireClientEvents(store: Store, clientId: string) {
@@ -51,4 +51,11 @@ export async function expireClientRequestWindow(store: Store, clientId: string) 
     .update(clientRequestLimits)
     .set({ timestamps: [new Date(Date.now() - 61000)] })
     .where(eq(clientRequestLimits.clientId, clientId))
+}
+
+export async function testParticipantRecordings(store: Store, allocationId: string) {
+  return store.db
+    .select({ sessionId: participantTokens.recordingSessionId, recording: participantTokens.recording })
+    .from(participantTokens)
+    .where(eq(participantTokens.allocationId, allocationId))
 }

@@ -6,8 +6,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net'
 
 // 실제 LiveKit 조회 응답을 전달하기 전에 세션 교체를 끝내도록 동기화합니다.
-export async function createLiveKitGate(upstream: string, afterGetParticipant: () => Promise<void>) {
+export async function createLiveKitGate(
+  upstream: string,
+  afterGetParticipant: () => Promise<void>,
+  beforeUpdateParticipant?: () => Promise<void>,
+) {
   let pending = true
+  let pendingUpdate = true
   let failure: unknown
   const methods: string[] = []
 
@@ -16,6 +21,10 @@ export async function createLiveKitGate(upstream: string, afterGetParticipant: (
     for await (const chunk of request) chunks.push(Buffer.from(chunk))
     const method = request.url?.split('/').at(-1) ?? ''
     methods.push(method)
+    if (pendingUpdate && method === 'UpdateParticipant') {
+      pendingUpdate = false
+      await beforeUpdateParticipant?.()
+    }
     const result = await fetch(new URL(request.url ?? '/', upstream), {
       method: request.method,
       headers: { authorization: request.headers.authorization ?? '', 'content-type': 'application/json' },

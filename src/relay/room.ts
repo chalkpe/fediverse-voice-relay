@@ -59,8 +59,7 @@ export function allocationParticipant(
     : undefined
 }
 
-// 녹음 상태는 LiveKit 세션마다 다른 속성 키에 둡니다.
-// 같은 identity의 새 세션에 이전 세션의 쓰기가 닿아도 새 세션의 녹음 상태는 바뀌지 않습니다.
+// 이전 제공자가 남긴 세션별 녹음 속성을 읽거나 정리할 때 사용합니다.
 export function recordingAttribute(sessionId: string): string {
   return `cherrypick.recording:${sessionId}`
 }

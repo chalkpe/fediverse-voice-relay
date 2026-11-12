@@ -139,24 +139,30 @@ export class LiveKit {
     const name = roomName(a)
     const current = await this.request(() => this.client.getParticipant(name, p.identity), true)
     if (current.sid !== p.sessionId || !allocationParticipant(current.metadata, a)) return false
-    const recording = p.recording === undefined ? undefined : recordingAttribute(current.sid)
+    // 녹음의 기준 상태는 DB 이벤트와 함께 커밋합니다. SFU에는 녹음 값을 쓰지 않습니다.
+    // 조회한 과거 SID 키만 정리하므로, 뒤늦은 요청도 현재 SID의 값을 지우지 않습니다.
+    const obsolete = Object.fromEntries(
+      Object.keys(current.attributes)
+        .filter((key) => key.startsWith('cherrypick.recording:') && key !== recordingAttribute(current.sid))
+        .map((key) => [key, '']),
+    )
     const updated = await this.request(
       () =>
         this.client.updateParticipant(name, p.identity, {
           attributes: {
             'cherrypick.micMuted': String(p.micMuted),
             'cherrypick.deafened': String(p.deafened),
-            ...(recording ? { [recording]: String(p.recording) } : {}),
+            ...obsolete,
           },
         }),
       true,
     )
     if (updated.sid === p.sessionId) return true
-    // 녹음은 요청한 세션의 키만 지우므로 새 세션의 녹음 상태는 남습니다.
+    // 이전 제공자가 남긴 녹음 키도 요청한 세션의 것만 정리합니다.
     await this.request(
       () =>
         this.client.updateParticipant(name, p.identity, {
-          attributes: { 'cherrypick.micMuted': '', 'cherrypick.deafened': '', ...(recording ? { [recording]: '' } : {}) },
+          attributes: { 'cherrypick.micMuted': '', 'cherrypick.deafened': '', [recordingAttribute(current.sid)]: '' },
         }),
       true,
     )

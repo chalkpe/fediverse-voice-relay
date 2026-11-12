@@ -345,18 +345,31 @@ export class Provider {
   }
 
   async snapshot(clientId: string, id: string): Promise<Snapshot> {
-    const [rev] = await this.store.db
-      .select({ revision: allocations.revision })
-      .from(allocations)
-      .where(and(eq(allocations.id, id), eq(allocations.clientId, clientId)))
     const a = await this.allocation(clientId, id)
+    // 참가자 조회 전에 녹음 상태와 revision을 함께 읽어, 조회 중 생긴 이벤트를 건너뛰지 않습니다.
+    const states = await this.store.db
+      .select({
+        revision: allocations.revision,
+        identityHash: participantTokens.identityHash,
+        sessionId: participantTokens.recordingSessionId,
+        recording: participantTokens.recording,
+      })
+      .from(allocations)
+      .leftJoin(participantTokens, eq(participantTokens.allocationId, allocations.id))
+      .where(and(eq(allocations.id, id), eq(allocations.clientId, clientId)))
+    const recording = new Map(states.map((state) => [state.identityHash, state]))
     const participants = a.state === 'ended' ? [] : await this.livekit.participants(a)
+    for (const participant of participants) {
+      const state = recording.get(identityHash(participant.identity))
+      // 전환 전 세션은 기존 SID 키를 읽습니다. 한 번 보고한 뒤에는 DB만 기준으로 삼습니다.
+      if (state?.sessionId) participant.recording = state.sessionId === participant.sessionId && state.recording === true
+    }
     return {
       allocationId: id,
       generation: a.generation,
       state: a.state,
       participants,
-      revision: String(rev.revision),
+      revision: String(states[0].revision),
     }
   }
 
@@ -448,7 +461,17 @@ export class Provider {
         if (this.livekit.isMissing(error)) return { accepted: false }
         throw error
       }
-      await this.store.tx((db) => this.store.event(db, a, 'participant'))
+      await this.store.tx(async (db) => {
+        if (action === 'status' && p.recording !== undefined && p.sessionId !== undefined) {
+          const updated = await drizzle(db)
+            .update(participantTokens)
+            .set({ recordingSessionId: p.sessionId, recording: p.recording })
+            .where(and(eq(participantTokens.allocationId, id), eq(participantTokens.identityHash, identityHash(p.identity))))
+            .returning({ identityHash: participantTokens.identityHash })
+          if (updated.length !== 1) throw new RelayError('PROVIDER_UNAVAILABLE', 503)
+        }
+        await this.store.event(db, a, 'participant')
+      })
       return { accepted: true }
     })
   }

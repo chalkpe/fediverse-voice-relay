@@ -11,8 +11,11 @@ import { WebSocket } from 'ws'
 import { createServer, type RelayService } from '../app/server.ts'
 import { LiveKit } from '../infra/livekit.ts'
 import { clients } from '../infra/schema.ts'
-import { createTestDatabase } from '../infra/test-database.ts'
+import type { Store } from '../infra/store.ts'
+import { testParticipantRecordings } from '../infra/test-data.ts'
+import { createTestDatabase, testAllocationLockPid } from '../infra/test-database.ts'
 import { testLiveKit } from '../infra/test-livekit.ts'
+import { createTestPostgresProxy } from '../infra/test-postgres-proxy.ts'
 import { createTestRoomScope } from '../infra/test-rooms.ts'
 import { clientToken } from './fixtures/client-token.ts'
 import { createLiveKitGate } from './fixtures/livekit-gate.ts'
@@ -28,6 +31,7 @@ type ResponseBody = {
   code: string
   token: string
   cursor: string
+  revision: string
   capabilities: Record<string, boolean>
   participants: Participant[]
   events: { allocationId: string; type: string }[]
@@ -66,7 +70,7 @@ beforeAll(async () => {
   port = (service.server.address() as AddressInfo).port
 })
 
-async function startRelay(livekit: typeof testLiveKit): Promise<RelayService> {
+async function startRelay(livekit: typeof testLiveKit, store: Store = database.store): Promise<RelayService> {
   const relay = await createServer(
     {
       databaseUrl: url,
@@ -79,7 +83,7 @@ async function startRelay(livekit: typeof testLiveKit): Promise<RelayService> {
       maxRooms: 10,
       iceServers: null,
     },
-    { store: database.store, migrate: false, startWorkers: false, loadSecrets: () => secrets },
+    { store, migrate: false, startWorkers: false, loadSecrets: () => secrets },
   )
   relay.server.listen(0, '127.0.0.1')
   await once(relay.server, 'listening')
@@ -353,4 +357,119 @@ test.each([
   expect(stored.attributes[`cherrypick.recording:${current.sid}`]).toBe(String(recording))
   expect(stored.attributes[`cherrypick.recording:${previous.sid}`]).toBeUndefined()
   expect(participant).toMatchObject({ sessionId: current.sid, recording })
+})
+
+test.each([true, false])('a status write that lost its PostgreSQL lock cannot reverse a newer recording %s report', async (recording) => {
+  const a = await allocation()
+  const identity = 'https://a.test/users/lost-lock'
+  const { sid } = await connect(a, await issue(a, identity, 'lost-lock'))
+  const before = await call('GET', `/voice-relay/v1/allocations/${a.id}/snapshot`)
+  const cursor = (await call('GET', '/voice-relay/v1/events')).body.cursor
+  const proxy = await createTestPostgresProxy(url)
+  const interrupted = database.connect({ connectionString: proxy.connectionString })
+  const disconnected = interrupted.nextDisconnect()
+  let lockPid: number | undefined
+  let newer: Awaited<ReturnType<typeof call>> | undefined
+  let newerStored: Awaited<ReturnType<typeof liveKitParticipant>> | undefined
+  const gate = await createLiveKitGate(
+    testLiveKit.url,
+    async () => {},
+    async () => {
+      // 과거 요청의 HTTP 쓰기를 받은 뒤 실제 PostgreSQL 연결을 끊습니다.
+      lockPid = await testAllocationLockPid(database, a.id)
+      expect(lockPid).toBeGreaterThan(0)
+      proxy.disconnect()
+      await disconnected
+      const response = await status(a, { identity, sessionId: sid, micMuted: false, deafened: false, recording })
+      expect(response).toEqual(accepted)
+      newer = await call('GET', `/voice-relay/v1/allocations/${a.id}/snapshot`)
+      expect(newer.body.participants.find((p) => p.identity === identity)).toMatchObject({ sessionId: sid, recording })
+      newerStored = await liveKitParticipant(a, identity)
+      expect(await testAllocationLockPid(database, a.id)).toBeUndefined()
+      // 다른 연결의 요청이 성공한 다음에만 보류한 SFU 쓰기를 전달합니다.
+    },
+  )
+  const relay = await startRelay({ ...testLiveKit, url: gate.url }, interrupted.store)
+  const requestPort = (relay.server.address() as AddressInfo).port
+
+  try {
+    const original = await status(
+      a,
+      { identity, sessionId: sid, micMuted: false, deafened: false, recording: !recording },
+      'client',
+      requestPort,
+    )
+    gate.verify()
+    const after = await call('GET', `/voice-relay/v1/allocations/${a.id}/snapshot`)
+    const stored = await liveKitParticipant(a, identity)
+    const recordingState = await testParticipantRecordings(database.store, a.id)
+    const feed = await participantEvents(a, cursor)
+    console.info(
+      'lock-loss evidence',
+      JSON.stringify({
+        lockPid,
+        original,
+        before: before.body,
+        newer: newer?.body,
+        newerStored,
+        after: after.body,
+        stored,
+        recordingState,
+        feed,
+      }),
+    )
+
+    expect(original).toEqual({ status: 503, body: { code: 'PROVIDER_UNAVAILABLE' } })
+    expect(newer).toBeDefined()
+    expect(BigInt(newer?.body.revision ?? '0')).toBeGreaterThan(BigInt(before.body.revision))
+    expect(after.body.revision).toBe(newer?.body.revision)
+    expect(feed.count).toBe(1)
+    expect(feed.cursor).toBe(`client:${after.body.revision}`)
+    expect.soft(after.body.participants.find((p) => p.identity === identity)).toMatchObject({ sessionId: sid, recording })
+    expect.soft(stored).toEqual(newerStored)
+    expect(recordingState).toEqual([{ sessionId: sid, recording }])
+  } finally {
+    await relay.close()
+    await interrupted.close()
+    await proxy.close()
+    await gate.close()
+  }
+})
+
+test('an existing SID recording value survives omission until the first database-backed report', async () => {
+  const a = await allocation()
+  const identity = 'https://a.test/users/upgrade'
+  const { sid } = await connect(a, await issue(a, identity, 'upgrade'))
+  await rooms.updateParticipant(roomName(a), identity, {
+    attributes: { [`cherrypick.recording:${sid}`]: 'true', 'cherrypick.recording:PA_obsolete': 'true' },
+  })
+  const gate = await createLiveKitGate(
+    testLiveKit.url,
+    async () => {},
+    async () => {
+      throw new Error('Injected SFU cleanup failure')
+    },
+  )
+  const relay = await startRelay({ ...testLiveKit, url: gate.url })
+  onTestFinished(async () => {
+    await relay.close()
+    await gate.close()
+  })
+  const failedPort = (relay.server.address() as AddressInfo).port
+  const failed = await status(a, { identity, sessionId: sid, micMuted: false, deafened: false }, 'client', failedPort)
+
+  expect(failed).toEqual({ status: 503, body: { code: 'PROVIDER_UNAVAILABLE' } })
+  expect(() => gate.verify()).toThrow('Injected SFU cleanup failure')
+  expect((await liveKitParticipant(a, identity)).attributes['cherrypick.recording:PA_obsolete']).toBe('true')
+
+  expect(await status(a, { identity, sessionId: sid, micMuted: false, deafened: false })).toEqual(accepted)
+  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: sid, recording: true })
+  expect((await liveKitParticipant(a, identity)).attributes['cherrypick.recording:PA_obsolete']).toBeUndefined()
+
+  expect(await status(a, { identity, sessionId: sid, micMuted: false, deafened: false, recording: false })).toEqual(accepted)
+  expect((await liveKitParticipant(a, identity)).attributes[`cherrypick.recording:${sid}`]).toBe('true')
+  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: sid, recording: false })
+
+  expect(await status(a, { identity, sessionId: sid, micMuted: true, deafened: false })).toEqual(accepted)
+  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: sid, recording: false, micMuted: true })
 })

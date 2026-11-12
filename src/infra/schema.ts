@@ -124,6 +124,8 @@ export const participantTokens = pgTable(
       .references(() => allocations.id),
     identityHash: text('identity_hash').notNull(),
     generation: uuid('generation').notNull(),
+    recordingSessionId: text('recording_session_id'),
+    recording: boolean('recording').notNull().default(false),
   },
   (t) => [primaryKey({ columns: [t.allocationId, t.identityHash] })],
 )

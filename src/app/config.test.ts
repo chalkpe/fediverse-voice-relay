@@ -4,7 +4,7 @@
 import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { expect, test } from 'vitest'
+import { expect, test, vi } from 'vitest'
 import { loadConfig, secretLoader } from './config.ts'
 
 test('screen share limits are optional, validate, and reload independently of connection settings', () => {
@@ -225,6 +225,33 @@ test('a malformed replacement key file retains the last valid authentication key
     expect((await loader()).client).toBe(secret)
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('unchanged file metadata cannot hide a same-size secret replacement', async () => {
+  const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
+  const directory = mkdtempSync(join(tmpdir(), 'relay-key-metadata-'))
+  const file = join(directory, 'keys.json')
+  const original = 'a'.repeat(64)
+  const replacement = 'b'.repeat(64)
+  writeFileSync(file, JSON.stringify({ client: original }))
+  const metadata = await fs.stat(file)
+  // WSL ext4에서 서로 다른 내용의 크기·mtime·ctime이 실제로 같았던 장애를 고정합니다.
+  vi.doMock('node:fs/promises', () => ({ ...fs, stat: async () => metadata }))
+  vi.resetModules()
+  try {
+    const { validatedSecretLoader } = await import('./config.ts')
+    const load = await validatedSecretLoader(file)
+
+    writeFileSync(file, '{invalid')
+    expect((await load()).client === original).toBe(true)
+    writeFileSync(file, JSON.stringify({ client: replacement }))
+
+    expect((await load()).client === replacement).toBe(true)
+  } finally {
+    vi.doUnmock('node:fs/promises')
+    vi.resetModules()
+    rmSync(directory, { recursive: true, force: true })
   }
 })
 

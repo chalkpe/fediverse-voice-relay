@@ -4,7 +4,7 @@
 import { decodeProtectedHeader } from 'jose'
 import { AccessToken, RoomServiceClient, TokenVerifier, TrackSource, TwirpError, WebhookReceiver } from 'livekit-server-sdk'
 import { CLIENT_TOKEN_TYPE } from '../relay/auth.ts'
-import { ownsRoom, parseParticipantMetadata, participantMetadata, roomMetadata, roomName } from '../relay/room.ts'
+import { allocationParticipant, ownsRoom, participantMetadata, recordingAttribute, roomMetadata, roomName } from '../relay/room.ts'
 import { type Allocation, type Participant, type RelayConfig, RelayError } from '../relay/types.ts'
 
 export { ownsRoom, roomName } from '../relay/room.ts'
@@ -109,8 +109,8 @@ export class LiveKit {
       throw err
     }
     return list.flatMap((p) => {
-      const m = parseParticipantMetadata(p.metadata)
-      if (!m || m.clientId !== a.clientId || m.allocationId !== a.id || m.generation !== a.generation) return []
+      const m = allocationParticipant(p.metadata, a)
+      if (!m) return []
       const mic = p.tracks.find((t) => t.source === TrackSource.MICROPHONE)
       return [
         {
@@ -120,6 +120,7 @@ export class LiveKit {
           screenSharing: p.tracks.some((t) => t.source === TrackSource.SCREEN_SHARE),
           micMuted: mic ? mic.muted : p.attributes['cherrypick.micMuted'] === 'true',
           deafened: p.attributes['cherrypick.deafened'] === 'true',
+          recording: p.attributes[recordingAttribute(p.sid)] === 'true',
           allowScreenShare:
             p.permission?.canPublish === true &&
             (p.permission.canPublishSources.length === 0 || p.permission.canPublishSources.includes(TrackSource.SCREEN_SHARE)),
@@ -127,5 +128,38 @@ export class LiveKit {
         },
       ]
     })
+  }
+
+  // LiveKit에는 session ID를 조건으로 쓰는 API가 없어 identity로 씁니다.
+  // 쓰기 전후의 session ID를 확인하고, 다른 세션에 닿은 쓰기는 되돌린 뒤 거절합니다.
+  async updateStatus(
+    a: Allocation,
+    p: { identity: string; sessionId?: string; micMuted?: boolean; deafened?: boolean; recording?: boolean },
+  ): Promise<boolean> {
+    const name = roomName(a)
+    const current = await this.request(() => this.client.getParticipant(name, p.identity), true)
+    if (current.sid !== p.sessionId || !allocationParticipant(current.metadata, a)) return false
+    const recording = p.recording === undefined ? undefined : recordingAttribute(current.sid)
+    const updated = await this.request(
+      () =>
+        this.client.updateParticipant(name, p.identity, {
+          attributes: {
+            'cherrypick.micMuted': String(p.micMuted),
+            'cherrypick.deafened': String(p.deafened),
+            ...(recording ? { [recording]: String(p.recording) } : {}),
+          },
+        }),
+      true,
+    )
+    if (updated.sid === p.sessionId) return true
+    // 녹음은 요청한 세션의 키만 지우므로 새 세션의 녹음 상태는 남습니다.
+    await this.request(
+      () =>
+        this.client.updateParticipant(name, p.identity, {
+          attributes: { 'cherrypick.micMuted': '', 'cherrypick.deafened': '', ...(recording ? { [recording]: '' } : {}) },
+        }),
+      true,
+    )
+    return false
   }
 }

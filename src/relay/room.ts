@@ -49,6 +49,22 @@ export function parseParticipantMetadata(metadata: string): ParticipantMetadata 
   }
 }
 
+export function allocationParticipant(
+  metadata: string,
+  allocation: Pick<Allocation, 'clientId' | 'id' | 'generation'>,
+): ParticipantMetadata | undefined {
+  const parsed = parseParticipantMetadata(metadata)
+  return parsed?.clientId === allocation.clientId && parsed.allocationId === allocation.id && parsed.generation === allocation.generation
+    ? parsed
+    : undefined
+}
+
+// 녹음 상태는 LiveKit 세션마다 다른 속성 키에 둡니다.
+// 같은 identity의 새 세션에 이전 세션의 쓰기가 닿아도 새 세션의 녹음 상태는 바뀌지 않습니다.
+export function recordingAttribute(sessionId: string): string {
+  return `cherrypick.recording:${sessionId}`
+}
+
 export function parseTokenMetadata(metadata: string): z.infer<typeof verifiedTokenMetadataSchema> | undefined {
   try {
     const parsed = verifiedTokenMetadataSchema.safeParse(JSON.parse(metadata))

@@ -98,7 +98,7 @@ export class Provider {
     )
     return {
       protocolVersion: 1 as const,
-      capabilities: { cancelPending: true as const, includeIceServers: true as const },
+      capabilities: { cancelPending: true as const, includeIceServers: true as const, recordingStatus: true as const },
       activeParticipants: counts.reduce((total, count) => total + count, 0),
       enabled: c.enabled,
       accepting: capacity.accepting,
@@ -407,7 +407,7 @@ export class Provider {
     clientId: string,
     id: string,
     action: string,
-    p: { identity: string; sessionId?: string; micMuted?: boolean; deafened?: boolean; allowScreenShare?: boolean },
+    p: { identity: string; sessionId?: string; micMuted?: boolean; deafened?: boolean; recording?: boolean; allowScreenShare?: boolean },
   ) {
     return this.store.serialized(id, async () => {
       const a = await this.usable(clientId, id)
@@ -423,28 +423,7 @@ export class Provider {
         if (action === 'kick') {
           await this.livekit.request(() => service.removeParticipant(name, p.identity), true)
         } else if (action === 'status') {
-          const current = await this.livekit.request(() => service.getParticipant(name, p.identity), true)
-          if (current.sid !== p.sessionId) return { accepted: false }
-          const updated = await this.livekit.request(
-            () =>
-              service.updateParticipant(name, p.identity, {
-                attributes: {
-                  'cherrypick.micMuted': String(p.micMuted),
-                  'cherrypick.deafened': String(p.deafened),
-                },
-              }),
-            true,
-          )
-          if (updated.sid !== p.sessionId) {
-            await this.livekit.request(
-              () =>
-                service.updateParticipant(name, p.identity, {
-                  attributes: { 'cherrypick.micMuted': '', 'cherrypick.deafened': '' },
-                }),
-              true,
-            )
-            return { accepted: false }
-          }
+          if (!(await this.livekit.updateStatus(a, p))) return { accepted: false }
         } else if (action === 'mute') {
           const participant = (await this.livekit.participants(a)).find((x) => x.identity === p.identity)
           const micTrackSid = participant?.micTrackSid

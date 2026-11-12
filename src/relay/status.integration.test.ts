@@ -1,0 +1,356 @@
+// SPDX-FileCopyrightText: Chalk <chalkpe@gmail.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+import { randomUUID } from 'node:crypto'
+import { once } from 'node:events'
+import type { AddressInfo } from 'node:net'
+import { SignalResponse } from '@livekit/protocol'
+import { RoomServiceClient } from 'livekit-server-sdk'
+import { afterAll, beforeAll, expect, onTestFinished, test } from 'vitest'
+import { WebSocket } from 'ws'
+import { createServer, type RelayService } from '../app/server.ts'
+import { LiveKit } from '../infra/livekit.ts'
+import { clients } from '../infra/schema.ts'
+import { createTestDatabase } from '../infra/test-database.ts'
+import { testLiveKit } from '../infra/test-livekit.ts'
+import { createTestRoomScope } from '../infra/test-rooms.ts'
+import { clientToken } from './fixtures/client-token.ts'
+import { createLiveKitGate } from './fixtures/livekit-gate.ts'
+import { Provider } from './provider.ts'
+import { roomName } from './room.ts'
+import type { Allocation, Participant } from './types.ts'
+
+type Tenant = 'client' | 'other'
+type Session = { socket: WebSocket; sid: string }
+// 시험에서 읽는 응답 필드만 둡니다.
+type ResponseBody = {
+  accepted: boolean
+  code: string
+  token: string
+  cursor: string
+  capabilities: Record<string, boolean>
+  participants: Participant[]
+  events: { allocationId: string; type: string }[]
+}
+
+const url = process.env.VOICE_RELAY_TEST_DATABASE_URL ?? 'postgres://voice-relay:voice-relay-test-only@127.0.0.1:17832/voice-relay'
+const secrets: Record<Tenant, string> = { client: 'c'.repeat(64), other: 'o'.repeat(64) }
+const origins: Record<Tenant, string> = { client: 'https://a.test', other: 'https://b.test' }
+const rtcQuery = 'protocol=16&sdk=js&version=2.23.0&auto_subscribe=0'
+const accepted = { status: 200, body: { accepted: true } }
+const roomScope = createTestRoomScope()
+const rooms = new RoomServiceClient(testLiveKit.url, testLiveKit.apiKey, testLiveKit.apiSecret)
+let database: Awaited<ReturnType<typeof createTestDatabase>>
+let provider: Provider
+let service: RelayService
+let port: number
+
+beforeAll(async () => {
+  database = await createTestDatabase({
+    connectionString: url,
+    initialize: async (fixture) => {
+      await fixture.store.db.insert(clients).values([
+        { id: 'client', origin: origins.client, enabled: true, maxSlots: 20, maxRooms: 10, allowScreenShare: false },
+        { id: 'other', origin: origins.other, enabled: true, maxSlots: 20, maxRooms: 10, allowScreenShare: false },
+      ])
+    },
+  })
+  provider = new Provider(database.store, new LiveKit(testLiveKit), {
+    maxSlots: 20,
+    maxRooms: 10,
+    mediaProvider: 'https://relay.test',
+    iceServers: null,
+  })
+  roomScope.attach(provider.livekit)
+  service = await startRelay(testLiveKit)
+  port = (service.server.address() as AddressInfo).port
+})
+
+async function startRelay(livekit: typeof testLiveKit): Promise<RelayService> {
+  const relay = await createServer(
+    {
+      databaseUrl: url,
+      host: '127.0.0.1',
+      port: 0,
+      publicUrl: 'https://relay.test',
+      clientSecretFile: '',
+      livekit,
+      maxSlots: 20,
+      maxRooms: 10,
+      iceServers: null,
+    },
+    { store: database.store, migrate: false, startWorkers: false, loadSecrets: () => secrets },
+  )
+  relay.server.listen(0, '127.0.0.1')
+  await once(relay.server, 'listening')
+  return relay
+}
+
+afterAll(async () => {
+  try {
+    await service?.close()
+  } finally {
+    try {
+      if (provider) await roomScope.close(provider)
+    } finally {
+      await database?.close()
+    }
+  }
+})
+
+async function call(method: string, path: string, body?: unknown, tenant: Tenant = 'client', requestPort = port) {
+  const response = await fetch(`http://127.0.0.1:${requestPort}${path}`, {
+    method,
+    headers: {
+      authorization: `Bearer ${await clientToken(secrets[tenant], origins[tenant])}`,
+      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(10000),
+  })
+  return { status: response.status, body: (await response.json()) as ResponseBody }
+}
+
+async function allocation(): Promise<Allocation> {
+  const a = await provider.allocate('client', { roomKey: `status-${randomUUID()}`, generation: 'g1', slots: 2 })
+  onTestFinished(async () => {
+    await provider.end('client', a.id)
+  })
+  return a
+}
+
+async function issue(a: Allocation, identity: string, userId: string): Promise<string> {
+  const joined = await call('POST', `/voice-relay/v1/allocations/${a.id}/join`, { identity, userId, allowScreenShare: false })
+  expect(joined.status).toBe(200)
+  return joined.body.token
+}
+
+function nextSignal(socket: WebSocket, kind: SignalResponse['message']['case']): Promise<SignalResponse> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Missing ${kind}`)), 10000)
+    socket.on('message', function message(data) {
+      const signal = SignalResponse.fromBinary(new Uint8Array(data as Buffer))
+      if (signal.message.case !== kind) return
+      clearTimeout(timer)
+      socket.off('message', message)
+      resolve(signal)
+    })
+    socket.once('error', (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+  })
+}
+
+async function joined(socket: WebSocket): Promise<Session> {
+  onTestFinished(() => {
+    socket.terminate()
+  })
+  socket.on('error', () => {})
+  const signal = await nextSignal(socket, 'join')
+  const sid = signal.message.case === 'join' ? signal.message.value.participant?.sid : undefined
+  if (!sid) throw new Error('LiveKit did not assign a session ID')
+  return { socket, sid }
+}
+
+// 이용 서버처럼 릴레이 RTC 경로로 참가자를 연결합니다.
+async function connect(a: Allocation, token: string): Promise<Session> {
+  const path = `/voice-relay/v1/allocations/${a.id}/rtc?access_token=${encodeURIComponent(token)}&${rtcQuery}`
+  const authorization = `Bearer ${await clientToken(secrets.client, origins.client)}`
+  return joined(new WebSocket(`ws://127.0.0.1:${port}${path}`, { headers: { authorization } }))
+}
+
+// 릴레이의 배정 잠금과 무관한 시점에 같은 identity의 새 세션이 LiveKit에 들어오는 경우입니다.
+function connectToLiveKit(token: string): Promise<Session> {
+  const base = testLiveKit.url.replace(/^http/, 'ws')
+  return joined(new WebSocket(`${base}/rtc?access_token=${encodeURIComponent(token)}&${rtcQuery}`))
+}
+
+function replaced(previous: Session): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('The previous session stayed connected')), 10000)
+    const done = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    previous.socket.once('close', done)
+    previous.socket.on('message', (data) => {
+      if (SignalResponse.fromBinary(new Uint8Array(data as Buffer)).message.case === 'leave') done()
+    })
+  })
+}
+
+function status(a: Allocation, body: Record<string, unknown>, tenant: Tenant = 'client', requestPort = port) {
+  return call('POST', `/voice-relay/v1/allocations/${a.id}/participants/status`, body, tenant, requestPort)
+}
+
+async function snapshotParticipant(a: Allocation, identity: string) {
+  const snapshot = await call('GET', `/voice-relay/v1/allocations/${a.id}/snapshot`)
+  expect(snapshot.status).toBe(200)
+  return snapshot.body.participants.find((participant) => participant.identity === identity)
+}
+
+async function liveKitParticipant(a: Allocation, identity: string) {
+  const participant = await rooms.getParticipant(roomName(a), identity)
+  return { sid: participant.sid, attributes: { ...participant.attributes } }
+}
+
+async function participantEvents(a: Allocation, cursor: string) {
+  const feed = await call('GET', `/voice-relay/v1/events?cursor=${encodeURIComponent(cursor)}`)
+  expect(feed.status).toBe(200)
+  const events = feed.body.events.filter((event) => event.allocationId === a.id)
+  return { cursor: feed.body.cursor, count: events.filter((event) => event.type === 'participant').length }
+}
+
+test('capacity advertises recording status beside the existing capabilities', async () => {
+  const capacity = await call('GET', '/voice-relay/v1/capacity')
+
+  expect(capacity.status).toBe(200)
+  expect(capacity.body.capabilities).toEqual({ cancelPending: true, includeIceServers: true, recordingStatus: true })
+})
+
+test('an earlier consumer status body is accepted and the snapshot keeps the session fields', async () => {
+  const a = await allocation()
+  const identity = 'https://a.test/users/earlier'
+  const session = await connect(a, await issue(a, identity, 'earlier'))
+
+  const response = await status(a, { identity, sessionId: session.sid, micMuted: true, deafened: true })
+
+  expect(response).toEqual(accepted)
+  expect(await snapshotParticipant(a, identity)).toEqual({
+    identity,
+    userId: 'earlier',
+    sessionId: session.sid,
+    screenSharing: false,
+    micMuted: true,
+    deafened: true,
+    recording: false,
+    allowScreenShare: false,
+    micTrackSid: null,
+  })
+})
+
+test('recording follows true and false reports and an omitted flag keeps the current state', async () => {
+  const a = await allocation()
+  const identity = 'https://a.test/users/recording'
+  const { sid } = await connect(a, await issue(a, identity, 'recording'))
+  let cursor = (await call('GET', '/voice-relay/v1/events')).body.cursor
+  const steps: [Record<string, boolean>, { recording: boolean; micMuted: boolean; deafened: boolean }][] = [
+    [{ recording: true }, { recording: true, micMuted: false, deafened: false }],
+    [{ micMuted: true }, { recording: true, micMuted: true, deafened: false }],
+    [{ recording: false }, { recording: false, micMuted: false, deafened: false }],
+    [{ deafened: true }, { recording: false, micMuted: false, deafened: true }],
+  ]
+
+  for (const [fields, expected] of steps) {
+    const response = await status(a, { identity, sessionId: sid, micMuted: false, deafened: false, ...fields })
+    const feed = await participantEvents(a, cursor)
+    cursor = feed.cursor
+
+    expect(response).toEqual(accepted)
+    expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: sid, ...expected })
+    expect(feed.count).toBe(1)
+  }
+})
+
+test('provider-foreign status fields are rejected without changing LiveKit attributes', async () => {
+  const a = await allocation()
+  const identity = 'https://a.test/users/foreign-fields'
+  const { sid } = await connect(a, await issue(a, identity, 'foreign-fields'))
+  expect(await status(a, { identity, sessionId: sid, micMuted: false, deafened: false, recording: true })).toEqual(accepted)
+  const before = await liveKitParticipant(a, identity)
+  const recordingId = randomUUID()
+
+  for (const fields of [{ recordingId }, { recording: false, recordingId }, { recording: null }, { recording: 'false' }, { extra: true }]) {
+    const response = await status(a, { identity, sessionId: sid, micMuted: true, deafened: true, ...fields })
+
+    expect(response).toEqual({ status: 400, body: { code: 'INVALID_REQUEST' } })
+  }
+
+  expect(await liveKitParticipant(a, identity)).toEqual(before)
+  expect(await snapshotParticipant(a, identity)).toMatchObject({ recording: true, micMuted: false, deafened: false })
+})
+
+test('another client cannot write the participant status of an allocation', async () => {
+  const a = await allocation()
+  const identity = 'https://a.test/users/tenant'
+  const { sid } = await connect(a, await issue(a, identity, 'tenant'))
+  const before = await liveKitParticipant(a, identity)
+
+  const response = await status(a, { identity, sessionId: sid, micMuted: true, deafened: true, recording: true }, 'other')
+
+  expect(response).toEqual({ status: 404, body: { code: 'NOT_FOUND' } })
+  expect(await liveKitParticipant(a, identity)).toEqual(before)
+})
+
+test('a reconnected identity starts without recording and its previous session cannot write', async () => {
+  const a = await allocation()
+  const identity = 'https://a.test/users/reconnect'
+  const previous = await connect(a, await issue(a, identity, 'reconnect'))
+  expect(await status(a, { identity, sessionId: previous.sid, micMuted: false, deafened: false, recording: true })).toEqual(accepted)
+
+  const leaving = replaced(previous)
+  const current = await connect(a, await issue(a, identity, 'reconnect'))
+  await leaving
+
+  expect(current.sid).not.toBe(previous.sid)
+  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: current.sid, recording: false })
+
+  expect(await status(a, { identity, sessionId: current.sid, micMuted: false, deafened: false, recording: true })).toEqual(accepted)
+  const stale = await status(a, { identity, sessionId: previous.sid, micMuted: true, deafened: true, recording: false })
+
+  expect(stale).toEqual({ status: 200, body: { accepted: false } })
+  expect(await snapshotParticipant(a, identity)).toMatchObject({
+    sessionId: current.sid,
+    recording: true,
+    micMuted: false,
+    deafened: false,
+  })
+})
+
+test.each([
+  { stale: false, recording: true },
+  { stale: true, recording: false },
+])('a replaced session that writes recording $stale keeps the new session recording $recording', async ({ stale, recording }) => {
+  const a = await allocation()
+  const identity = 'https://a.test/users/race'
+  const previous = await connect(a, await issue(a, identity, 'race'))
+  // 배정 잠금을 잡은 요청 안에서는 새 참여 토큰을 받을 수 없으므로 미리 받아 둡니다.
+  const reconnectToken = await issue(a, identity, 'race')
+  const replacement: { session?: Session } = {}
+  const gate = await createLiveKitGate(testLiveKit.url, async () => {
+    const leaving = replaced(previous)
+    const session = await connectToLiveKit(reconnectToken)
+    replacement.session = session
+    await leaving
+    // 잠금을 잃은 다른 제공자 프로세스의 쓰기를 실제 LiveKit 속성으로 준비합니다.
+    const written = await rooms.updateParticipant(roomName(a), identity, {
+      attributes: { [`cherrypick.recording:${session.sid}`]: String(recording) },
+    })
+    expect(written.sid).toBe(session.sid)
+  })
+  onTestFinished(() => gate.close())
+  const relay = await startRelay({ ...testLiveKit, url: gate.url })
+  onTestFinished(() => relay.close())
+  const requestPort = (relay.server.address() as AddressInfo).port
+
+  const result = await status(
+    a,
+    { identity, sessionId: previous.sid, micMuted: true, deafened: true, recording: stale },
+    'client',
+    requestPort,
+  )
+
+  gate.verify()
+  expect(result).toEqual({ status: 200, body: { accepted: false } })
+  const current = replacement.session
+  if (!current) throw new Error('The replacement session did not join')
+  const stored = await liveKitParticipant(a, identity)
+  const participant = await snapshotParticipant(a, identity)
+
+  expect(gate.methods).toEqual(['GetParticipant', 'UpdateParticipant', 'UpdateParticipant'])
+  expect(stored.sid).toBe(current.sid)
+  expect(stored.attributes[`cherrypick.recording:${current.sid}`]).toBe(String(recording))
+  expect(stored.attributes[`cherrypick.recording:${previous.sid}`]).toBeUndefined()
+  expect(participant).toMatchObject({ sessionId: current.sid, recording })
+})

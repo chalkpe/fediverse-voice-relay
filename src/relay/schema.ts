@@ -40,6 +40,7 @@ export const statusRequestSchema = z.strictObject({
   sessionId: textSchema(2048),
   micMuted: z.boolean(),
   deafened: z.boolean(),
+  recording: z.boolean().optional().describe('Recording state of this session. Omit to keep the current state.'),
 })
 
 export const identityRequestSchema = z.strictObject({ identity: textSchema(2048) })
@@ -82,6 +83,7 @@ export const capacitySchema = z
       .object({
         cancelPending: z.boolean().optional(),
         includeIceServers: z.boolean().optional(),
+        recordingStatus: z.boolean().optional().describe('Participant status accepts the optional recording flag'),
       })
       .optional(),
     enabled: z.boolean(),
@@ -114,6 +116,7 @@ export const participantSchema = z.strictObject({
   screenSharing: z.boolean(),
   micMuted: z.boolean().optional(),
   deafened: z.boolean().optional(),
+  recording: z.boolean().optional().describe('Recording state reported for the current session ID'),
   allowScreenShare: z.boolean(),
   micTrackSid: z.string().nullable(),
 })

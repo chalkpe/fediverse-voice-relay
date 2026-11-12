@@ -106,3 +106,134 @@ test('trusted refresh keys verify alongside the active key without accepting unk
   await expect(livekit.verify(await token('unknown', refresh.apiSecret))).rejects.toThrow()
   await expect(livekit.verify(await token(refresh.apiKey, 'x'.repeat(32)))).rejects.toThrow()
 })
+
+const statusAllocation: Allocation = {
+  id: 'allocation',
+  clientId: 'client',
+  roomKey: 'room',
+  generation: 'generation',
+  reservedSlots: 2,
+  state: 'active',
+  createdAt: '',
+  leaseExpiresAt: '',
+}
+
+const member = JSON.stringify({ clientId: 'client', allocationId: 'allocation', generation: 'generation', userId: 'user' })
+
+function participantInfo(identity: string, sid: string, attributes: Record<string, string>) {
+  return { identity, sid, metadata: member, attributes, tracks: [], permission: undefined }
+}
+
+function recordStatusWrites(livekit: LiveKit, sessions: { read: string; written: string; metadata?: string }) {
+  const writes: Record<string, string>[] = []
+  livekit.client.getParticipant = async () => ({ sid: sessions.read, metadata: sessions.metadata ?? member }) as never
+  livekit.client.updateParticipant = async (
+    _room: string,
+    _identity: string,
+    options?: string | { attributes?: Record<string, string> },
+  ) => {
+    writes.push({ ...(typeof options === 'object' ? options.attributes : {}) })
+    return { sid: sessions.written } as never
+  }
+  return writes
+}
+
+test('snapshot recording reads only the key of the current LiveKit session', async () => {
+  const livekit = new LiveKit({ ...testLiveKit, url: 'http://127.0.0.1:1' })
+  livekit.client.listParticipants = async () =>
+    [
+      participantInfo('reconnected', 'PA_current', { 'cherrypick.recording:PA_previous': 'true', 'cherrypick.recording': 'true' }),
+      participantInfo('recording', 'PA_recording', { 'cherrypick.recording:PA_recording': 'true' }),
+      participantInfo('stopped', 'PA_stopped', { 'cherrypick.recording:PA_stopped': 'false' }),
+    ] as never
+
+  const participants = await livekit.participants(statusAllocation)
+
+  expect(participants.map((p) => [p.identity, p.sessionId, p.recording])).toEqual([
+    ['reconnected', 'PA_current', false],
+    ['recording', 'PA_recording', true],
+    ['stopped', 'PA_stopped', false],
+  ])
+})
+
+test('a status write without recording leaves the recording state untouched', async () => {
+  const livekit = new LiveKit({ ...testLiveKit, url: 'http://127.0.0.1:1' })
+  const writes = recordStatusWrites(livekit, { read: 'PA_session', written: 'PA_session' })
+
+  const accepted = await livekit.updateStatus(statusAllocation, {
+    identity: 'user',
+    sessionId: 'PA_session',
+    micMuted: true,
+    deafened: false,
+  })
+
+  expect(accepted).toBe(true)
+  expect(writes).toEqual([{ 'cherrypick.micMuted': 'true', 'cherrypick.deafened': 'false' }])
+})
+
+test.each([true, false])('recording %s is written under the verified session key', async (recording) => {
+  const livekit = new LiveKit({ ...testLiveKit, url: 'http://127.0.0.1:1' })
+  const writes = recordStatusWrites(livekit, { read: 'PA_session', written: 'PA_session' })
+
+  const accepted = await livekit.updateStatus(statusAllocation, {
+    identity: 'user',
+    sessionId: 'PA_session',
+    micMuted: false,
+    deafened: false,
+    recording,
+  })
+
+  expect(accepted).toBe(true)
+  expect(writes).toEqual([
+    { 'cherrypick.micMuted': 'false', 'cherrypick.deafened': 'false', 'cherrypick.recording:PA_session': String(recording) },
+  ])
+})
+
+test('a stale session or a participant of another allocation is not written', async () => {
+  const foreign = JSON.stringify({ clientId: 'client', allocationId: 'allocation', generation: 'previous', userId: 'user' })
+
+  for (const sessions of [
+    { read: 'PA_current', written: 'PA_current' },
+    { read: 'PA_session', written: 'PA_session', metadata: foreign },
+    { read: 'PA_session', written: 'PA_session', metadata: '' },
+  ]) {
+    const livekit = new LiveKit({ ...testLiveKit, url: 'http://127.0.0.1:1' })
+    const writes = recordStatusWrites(livekit, sessions)
+
+    const accepted = await livekit.updateStatus(statusAllocation, {
+      identity: 'user',
+      sessionId: 'PA_session',
+      micMuted: true,
+      deafened: true,
+      recording: true,
+    })
+
+    expect(accepted).toBe(false)
+    expect(writes).toEqual([])
+  }
+})
+
+test.each([undefined, false, true])(
+  'a write with recording %s that reaches a newer session clears only the requesting session keys',
+  async (recording) => {
+    const livekit = new LiveKit({ ...testLiveKit, url: 'http://127.0.0.1:1' })
+    const writes = recordStatusWrites(livekit, { read: 'PA_previous', written: 'PA_current' })
+
+    const accepted = await livekit.updateStatus(statusAllocation, {
+      identity: 'user',
+      sessionId: 'PA_previous',
+      micMuted: false,
+      deafened: false,
+      recording,
+    })
+
+    const recorded = recording === undefined ? {} : { 'cherrypick.recording:PA_previous': String(recording) }
+    const cleared = recording === undefined ? {} : { 'cherrypick.recording:PA_previous': '' }
+    expect(accepted).toBe(false)
+    expect(writes).toEqual([
+      { 'cherrypick.micMuted': 'false', 'cherrypick.deafened': 'false', ...recorded },
+      { 'cherrypick.micMuted': '', 'cherrypick.deafened': '', ...cleared },
+    ])
+    expect(writes.flatMap((attributes) => Object.keys(attributes))).not.toContain('cherrypick.recording:PA_current')
+  },
+)

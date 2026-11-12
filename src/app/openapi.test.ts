@@ -123,6 +123,38 @@ test('serves generated OpenAPI and Swagger without authentication', async () => 
   }
 })
 
+type JsonSchema = {
+  type?: string
+  required?: string[]
+  additionalProperties?: boolean
+  properties: Record<string, JsonSchema>
+  items: JsonSchema
+}
+
+test('generated participant status contract documents the optional recording flag', async () => {
+  const service = await createServer(config, { store: { pool: {} } as Store, migrate: false, startWorkers: false, loadSecrets: () => ({}) })
+  try {
+    const doc = (await (await service.app.request('/openapi.json')).json()) as {
+      paths: Record<string, Record<string, { requestBody: { content: Record<string, { schema: JsonSchema }> } } & Operation>>
+    }
+    const status = doc.paths['/voice-relay/v1/allocations/{id}/participants/status'].post.requestBody.content['application/json'].schema
+    const snapshot = (
+      doc.paths['/voice-relay/v1/allocations/{id}/snapshot'].get.responses['200'] as { content: Record<string, { schema: JsonSchema }> }
+    ).content['application/json'].schema
+
+    expect(status.properties.recording).toMatchObject({ type: 'boolean' })
+    expect(status.required).toEqual(['identity', 'sessionId', 'micMuted', 'deafened'])
+    expect(status.additionalProperties).toBe(false)
+    expect(snapshot.properties.participants.items.properties.recording).toMatchObject({ type: 'boolean' })
+    expect(snapshot.properties.participants.items.required).not.toContain('recording')
+    const capacity = (doc as unknown as { components: { schemas: { Capacity: JsonSchema } } }).components.schemas.Capacity
+    expect(Object.keys(capacity.properties.capabilities.properties)).toEqual(['cancelPending', 'includeIceServers', 'recordingStatus'])
+    expect(capacity.properties.capabilities.properties.recordingStatus).toMatchObject({ type: 'boolean' })
+  } finally {
+    await service.close()
+  }
+})
+
 test('independent services bind ephemeral listeners and close both', async () => {
   const store = { pool: { totalCount: 0, idleCount: 0, waitingCount: 0 } } as unknown as Store
   const first = await createServer(config, { store, migrate: false, startWorkers: false, loadSecrets: () => ({}) })

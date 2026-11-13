@@ -120,10 +120,6 @@ const statusAllocation: Allocation = {
 
 const member = JSON.stringify({ clientId: 'client', allocationId: 'allocation', generation: 'generation', userId: 'user' })
 
-function participantInfo(identity: string, sid: string, attributes: Record<string, string>) {
-  return { identity, sid, metadata: member, attributes, tracks: [], permission: undefined }
-}
-
 function recordStatusWrites(livekit: LiveKit, sessions: { read: string; written: string; metadata?: string }) {
   const writes: Record<string, string>[] = []
   livekit.client.getParticipant = async () => ({ sid: sessions.read, metadata: sessions.metadata ?? member, attributes: {} }) as never
@@ -137,24 +133,6 @@ function recordStatusWrites(livekit: LiveKit, sessions: { read: string; written:
   }
   return writes
 }
-
-test('snapshot recording reads only the key of the current LiveKit session', async () => {
-  const livekit = new LiveKit({ ...testLiveKit, url: 'http://127.0.0.1:1' })
-  livekit.client.listParticipants = async () =>
-    [
-      participantInfo('reconnected', 'PA_current', { 'cherrypick.recording:PA_previous': 'true', 'cherrypick.recording': 'true' }),
-      participantInfo('recording', 'PA_recording', { 'cherrypick.recording:PA_recording': 'true' }),
-      participantInfo('stopped', 'PA_stopped', { 'cherrypick.recording:PA_stopped': 'false' }),
-    ] as never
-
-  const participants = await livekit.participants(statusAllocation)
-
-  expect(participants.map((p) => [p.identity, p.sessionId, p.recording])).toEqual([
-    ['reconnected', 'PA_current', false],
-    ['recording', 'PA_recording', true],
-    ['stopped', 'PA_stopped', false],
-  ])
-})
 
 test('a status write without recording leaves the recording state untouched', async () => {
   const livekit = new LiveKit({ ...testLiveKit, url: 'http://127.0.0.1:1' })
@@ -228,8 +206,7 @@ test.each([undefined, false, true])(
     expect(accepted).toBe(false)
     expect(writes).toEqual([
       { 'cherrypick.micMuted': 'false', 'cherrypick.deafened': 'false' },
-      { 'cherrypick.micMuted': '', 'cherrypick.deafened': '', 'cherrypick.recording:PA_previous': '' },
+      { 'cherrypick.micMuted': '', 'cherrypick.deafened': '' },
     ])
-    expect(writes.flatMap((attributes) => Object.keys(attributes))).not.toContain('cherrypick.recording:PA_current')
   },
 )

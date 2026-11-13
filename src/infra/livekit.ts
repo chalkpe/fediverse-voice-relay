@@ -4,7 +4,7 @@
 import { decodeProtectedHeader } from 'jose'
 import { AccessToken, RoomServiceClient, TokenVerifier, TrackSource, TwirpError, WebhookReceiver } from 'livekit-server-sdk'
 import { CLIENT_TOKEN_TYPE } from '../relay/auth.ts'
-import { allocationParticipant, ownsRoom, participantMetadata, recordingAttribute, roomMetadata, roomName } from '../relay/room.ts'
+import { allocationParticipant, ownsRoom, participantMetadata, roomMetadata, roomName } from '../relay/room.ts'
 import { type Allocation, type Participant, type RelayConfig, RelayError } from '../relay/types.ts'
 
 export { ownsRoom, roomName } from '../relay/room.ts'
@@ -120,7 +120,7 @@ export class LiveKit {
           screenSharing: p.tracks.some((t) => t.source === TrackSource.SCREEN_SHARE),
           micMuted: mic ? mic.muted : p.attributes['cherrypick.micMuted'] === 'true',
           deafened: p.attributes['cherrypick.deafened'] === 'true',
-          recording: p.attributes[recordingAttribute(p.sid)] === 'true',
+          recording: false,
           allowScreenShare:
             p.permission?.canPublish === true &&
             (p.permission.canPublishSources.length === 0 || p.permission.canPublishSources.includes(TrackSource.SCREEN_SHARE)),
@@ -140,29 +140,21 @@ export class LiveKit {
     const current = await this.request(() => this.client.getParticipant(name, p.identity), true)
     if (current.sid !== p.sessionId || !allocationParticipant(current.metadata, a)) return false
     // 녹음의 기준 상태는 DB 이벤트와 함께 커밋합니다. SFU에는 녹음 값을 쓰지 않습니다.
-    // 조회한 과거 SID 키만 정리하므로, 뒤늦은 요청도 현재 SID의 값을 지우지 않습니다.
-    const obsolete = Object.fromEntries(
-      Object.keys(current.attributes)
-        .filter((key) => key.startsWith('cherrypick.recording:') && key !== recordingAttribute(current.sid))
-        .map((key) => [key, '']),
-    )
     const updated = await this.request(
       () =>
         this.client.updateParticipant(name, p.identity, {
           attributes: {
             'cherrypick.micMuted': String(p.micMuted),
             'cherrypick.deafened': String(p.deafened),
-            ...obsolete,
           },
         }),
       true,
     )
     if (updated.sid === p.sessionId) return true
-    // 이전 제공자가 남긴 녹음 키도 요청한 세션의 것만 정리합니다.
     await this.request(
       () =>
         this.client.updateParticipant(name, p.identity, {
-          attributes: { 'cherrypick.micMuted': '', 'cherrypick.deafened': '', [recordingAttribute(current.sid)]: '' },
+          attributes: { 'cherrypick.micMuted': '', 'cherrypick.deafened': '' },
         }),
       true,
     )

@@ -346,32 +346,35 @@ export class Provider {
 
   async snapshot(clientId: string, id: string): Promise<Snapshot> {
     // 참가자 조회 전에 배정과 녹음 상태, revision을 같은 DB 경계에서 읽습니다.
-    const states = await this.store.db
+    const [result] = await this.store.db
       .select({
         allocation: allocations,
-        identityHash: participantTokens.identityHash,
-        sessionId: participantTokens.recordingSessionId,
-        recording: participantTokens.recording,
+        recordings: sql<{ identityHash: string; sessionId: string; recording: boolean }[]>`
+          coalesce(json_agg(json_build_object(
+            'identityHash', ${participantTokens.identityHash},
+            'sessionId', ${participantTokens.recordingSessionId},
+            'recording', ${participantTokens.recording}
+          )) filter (where ${participantTokens.recordingSessionId} is not null), '[]'::json)
+        `,
       })
       .from(allocations)
       .leftJoin(participantTokens, eq(participantTokens.allocationId, allocations.id))
       .where(and(eq(allocations.id, id), eq(allocations.clientId, clientId)))
-    const [first] = states
-    if (!first) throw new RelayError('NOT_FOUND', 404)
-    const a = typedAllocation(first.allocation)
-    const recording = new Map(states.map((state) => [state.identityHash, state]))
+      .groupBy(allocations.id)
+    if (!result) throw new RelayError('NOT_FOUND', 404)
+    const a = typedAllocation(result.allocation)
+    const recording = new Map(result.recordings.map((state) => [state.identityHash, state]))
     const participants = a.state === 'ended' ? [] : await this.livekit.participants(a)
     for (const participant of participants) {
       const state = recording.get(identityHash(participant.identity))
-      // 현재 SID가 명시적으로 보고하기 전에는 그 SID의 기존 속성을 읽습니다.
-      if (state?.sessionId === participant.sessionId) participant.recording = state.recording === true
+      participant.recording = state?.sessionId === participant.sessionId && state.recording
     }
     return {
       allocationId: id,
       generation: a.generation,
       state: a.state,
       participants,
-      revision: String(first.allocation.revision),
+      revision: String(result.allocation.revision),
     }
   }
 

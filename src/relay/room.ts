@@ -59,11 +59,6 @@ export function allocationParticipant(
     : undefined
 }
 
-// 이전 제공자가 남긴 세션별 녹음 속성을 읽거나 정리할 때 사용합니다.
-export function recordingAttribute(sessionId: string): string {
-  return `cherrypick.recording:${sessionId}`
-}
-
 export function parseTokenMetadata(metadata: string): z.infer<typeof verifiedTokenMetadataSchema> | undefined {
   try {
     const parsed = verifiedTokenMetadataSchema.safeParse(JSON.parse(metadata))

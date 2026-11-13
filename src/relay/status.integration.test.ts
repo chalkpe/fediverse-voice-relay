@@ -315,10 +315,7 @@ test('a reconnected identity starts without recording and its previous session c
   })
 })
 
-test.each([
-  { stale: false, recording: true },
-  { stale: true, recording: false },
-])('a replaced session that writes recording $stale keeps the new session recording $recording', async ({ stale, recording }) => {
+test.each([true, false])('a replaced session rejects a stale recording %s update', async (recording) => {
   const a = await allocation()
   const identity = 'https://a.test/users/race'
   const previous = await connect(a, await issue(a, identity, 'race'))
@@ -327,39 +324,24 @@ test.each([
   const replacement: { session?: Session } = {}
   const gate = await createLiveKitGate(testLiveKit.url, async () => {
     const leaving = replaced(previous)
-    const session = await connectToLiveKit(reconnectToken)
-    replacement.session = session
+    replacement.session = await connectToLiveKit(reconnectToken)
     await leaving
-    // 잠금을 잃은 다른 제공자 프로세스의 쓰기를 실제 LiveKit 속성으로 준비합니다.
-    const written = await rooms.updateParticipant(roomName(a), identity, {
-      attributes: { [`cherrypick.recording:${session.sid}`]: String(recording) },
-    })
-    expect(written.sid).toBe(session.sid)
   })
   onTestFinished(() => gate.close())
   const relay = await startRelay({ ...testLiveKit, url: gate.url })
   onTestFinished(() => relay.close())
   const requestPort = (relay.server.address() as AddressInfo).port
 
-  const result = await status(
-    a,
-    { identity, sessionId: previous.sid, micMuted: true, deafened: true, recording: stale },
-    'client',
-    requestPort,
-  )
+  const result = await status(a, { identity, sessionId: previous.sid, micMuted: true, deafened: true, recording }, 'client', requestPort)
 
   gate.verify()
   expect(result).toEqual({ status: 200, body: { accepted: false } })
   const current = replacement.session
   if (!current) throw new Error('The replacement session did not join')
-  const stored = await liveKitParticipant(a, identity)
-  const participant = await snapshotParticipant(a, identity)
-
   expect(gate.methods).toEqual(['GetParticipant', 'UpdateParticipant', 'UpdateParticipant'])
-  expect(stored.sid).toBe(current.sid)
-  expect(stored.attributes[`cherrypick.recording:${current.sid}`]).toBe(String(recording))
-  expect(stored.attributes[`cherrypick.recording:${previous.sid}`]).toBeUndefined()
-  expect(participant).toMatchObject({ sessionId: current.sid, recording })
+  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: current.sid, recording: false })
+  expect(await status(a, { identity, sessionId: current.sid, micMuted: false, deafened: false, recording: true })).toEqual(accepted)
+  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: current.sid, recording: true })
 })
 
 test.each([true, false])('a status write that lost its PostgreSQL lock cannot reverse a newer recording %s report', async (recording) => {
@@ -439,44 +421,6 @@ test.each([true, false])('a status write that lost its PostgreSQL lock cannot re
   }
 })
 
-test('an existing SID recording value survives omission until the first database-backed report', async () => {
-  const a = await allocation()
-  const identity = 'https://a.test/users/upgrade'
-  const { sid } = await connect(a, await issue(a, identity, 'upgrade'))
-  await rooms.updateParticipant(roomName(a), identity, {
-    attributes: { [`cherrypick.recording:${sid}`]: 'true', 'cherrypick.recording:PA_obsolete': 'true' },
-  })
-  const gate = await createLiveKitGate(
-    testLiveKit.url,
-    async () => {},
-    async () => {
-      throw new Error('Injected SFU cleanup failure')
-    },
-  )
-  const relay = await startRelay({ ...testLiveKit, url: gate.url })
-  onTestFinished(async () => {
-    await relay.close()
-    await gate.close()
-  })
-  const failedPort = (relay.server.address() as AddressInfo).port
-  const failed = await status(a, { identity, sessionId: sid, micMuted: false, deafened: false }, 'client', failedPort)
-
-  expect(failed).toEqual({ status: 503, body: { code: 'PROVIDER_UNAVAILABLE' } })
-  expect(() => gate.verify()).toThrow('Injected SFU cleanup failure')
-  expect((await liveKitParticipant(a, identity)).attributes['cherrypick.recording:PA_obsolete']).toBe('true')
-
-  expect(await status(a, { identity, sessionId: sid, micMuted: false, deafened: false })).toEqual(accepted)
-  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: sid, recording: true })
-  expect((await liveKitParticipant(a, identity)).attributes['cherrypick.recording:PA_obsolete']).toBeUndefined()
-
-  expect(await status(a, { identity, sessionId: sid, micMuted: false, deafened: false, recording: false })).toEqual(accepted)
-  expect((await liveKitParticipant(a, identity)).attributes[`cherrypick.recording:${sid}`]).toBe('true')
-  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: sid, recording: false })
-
-  expect(await status(a, { identity, sessionId: sid, micMuted: true, deafened: false })).toEqual(accepted)
-  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: sid, recording: false, micMuted: true })
-})
-
 test('a snapshot paused after its first database read can recover a concurrent HTTP end', async () => {
   const a = await allocation()
   const before = await call('GET', `/voice-relay/v1/allocations/${a.id}/snapshot`)
@@ -519,32 +463,37 @@ test('a snapshot paused after its first database read can recover a concurrent H
   }
 }, 20000)
 
-test('a previous SID database marker preserves the current SID legacy recording until an explicit report', async () => {
+test('a snapshot and its revision share the recording database read during a concurrent status update', async () => {
   const a = await allocation()
-  const identity = 'https://a.test/users/rollback'
-  const previous = await connect(a, await issue(a, identity, 'rollback'))
-  expect(await status(a, { identity, sessionId: previous.sid, micMuted: false, deafened: false, recording: true })).toEqual(accepted)
-  const leaving = replaced(previous)
-  const current = await connect(a, await issue(a, identity, 'rollback'))
-  await leaving
-  expect(current.sid).not.toBe(previous.sid)
+  const identity = 'https://a.test/users/snapshot-recording'
+  const { sid } = await connect(a, await issue(a, identity, 'snapshot-recording'))
+  const gate = await createTestPostgresReadGate(url)
+  const reader = database.connect({ connectionString: gate.connectionString })
+  const relay = await startRelay(testLiveKit, reader.store)
+  const readerPort = (relay.server.address() as AddressInfo).port
+  const pending = call('GET', `/voice-relay/v1/allocations/${a.id}/snapshot`, undefined, 'client', readerPort)
 
-  // 이전 앱의 상태 보고 결과를 준비하는 SFU fixture이며, 전체 버전 복구 실행은 별도로 검증합니다.
-  await rooms.updateParticipant(roomName(a), identity, { attributes: { [`cherrypick.recording:${current.sid}`]: 'true' } })
-  const marker = await testParticipantRecordings(database.store, a.id)
-  expect(marker).toEqual([{ sessionId: previous.sid, recording: true }])
-  const initial = await snapshotParticipant(a, identity)
-  expect.soft(initial).toMatchObject({ sessionId: current.sid, recording: true })
+  try {
+    await gate.next()
+    expect(await status(a, { identity, sessionId: sid, micMuted: false, deafened: false, recording: true })).toEqual(accepted)
+    const committed = await call('GET', `/voice-relay/v1/allocations/${a.id}/snapshot`)
+    expect(committed.body.participants.find((participant) => participant.identity === identity)).toMatchObject({ recording: true })
 
-  expect(await status(a, { identity, sessionId: current.sid, micMuted: true, deafened: true })).toEqual(accepted)
-  const omitted = await snapshotParticipant(a, identity)
-  expect.soft(omitted).toMatchObject({ sessionId: current.sid, recording: true, micMuted: true, deafened: true })
-  expect(await testParticipantRecordings(database.store, a.id)).toEqual(marker)
-
-  expect(await status(a, { identity, sessionId: current.sid, micMuted: false, deafened: false, recording: false })).toEqual(accepted)
-  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: current.sid, recording: false })
-  expect((await liveKitParticipant(a, identity)).attributes[`cherrypick.recording:${current.sid}`]).toBe('true')
-  expect(await status(a, { identity, sessionId: current.sid, micMuted: true, deafened: false })).toEqual(accepted)
-  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: current.sid, recording: false, micMuted: true })
-  console.info('snapshot-legacy evidence', JSON.stringify({ previousSid: previous.sid, currentSid: current.sid, marker, initial, omitted }))
-})
+    gate.release()
+    const snapshot = await pending
+    const feed = await call('GET', `/voice-relay/v1/events?cursor=client:${snapshot.body.revision}`)
+    expect(snapshot.status).toBe(200)
+    expect(snapshot.body.participants.find((participant) => participant.identity === identity)).toMatchObject({
+      sessionId: sid,
+      recording: false,
+    })
+    expect(BigInt(snapshot.body.revision)).toBeLessThan(BigInt(committed.body.revision))
+    expect(feed.body.events.some((event) => event.allocationId === a.id && event.type === 'participant')).toBe(true)
+  } finally {
+    gate.release()
+    await pending.catch(() => {})
+    await relay.close()
+    await reader.close()
+    await gate.close()
+  }
+}, 20000)

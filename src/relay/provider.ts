@@ -345,11 +345,10 @@ export class Provider {
   }
 
   async snapshot(clientId: string, id: string): Promise<Snapshot> {
-    const a = await this.allocation(clientId, id)
-    // 참가자 조회 전에 녹음 상태와 revision을 함께 읽어, 조회 중 생긴 이벤트를 건너뛰지 않습니다.
+    // 참가자 조회 전에 배정과 녹음 상태, revision을 같은 DB 경계에서 읽습니다.
     const states = await this.store.db
       .select({
-        revision: allocations.revision,
+        allocation: allocations,
         identityHash: participantTokens.identityHash,
         sessionId: participantTokens.recordingSessionId,
         recording: participantTokens.recording,
@@ -357,19 +356,22 @@ export class Provider {
       .from(allocations)
       .leftJoin(participantTokens, eq(participantTokens.allocationId, allocations.id))
       .where(and(eq(allocations.id, id), eq(allocations.clientId, clientId)))
+    const [first] = states
+    if (!first) throw new RelayError('NOT_FOUND', 404)
+    const a = typedAllocation(first.allocation)
     const recording = new Map(states.map((state) => [state.identityHash, state]))
     const participants = a.state === 'ended' ? [] : await this.livekit.participants(a)
     for (const participant of participants) {
       const state = recording.get(identityHash(participant.identity))
-      // 전환 전 세션은 기존 SID 키를 읽습니다. 한 번 보고한 뒤에는 DB만 기준으로 삼습니다.
-      if (state?.sessionId) participant.recording = state.sessionId === participant.sessionId && state.recording === true
+      // 현재 SID가 명시적으로 보고하기 전에는 그 SID의 기존 속성을 읽습니다.
+      if (state?.sessionId === participant.sessionId) participant.recording = state.recording === true
     }
     return {
       allocationId: id,
       generation: a.generation,
       state: a.state,
       participants,
-      revision: String(states[0].revision),
+      revision: String(first.allocation.revision),
     }
   }
 

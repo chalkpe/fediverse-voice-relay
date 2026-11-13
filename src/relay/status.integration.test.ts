@@ -16,6 +16,7 @@ import { testParticipantRecordings } from '../infra/test-data.ts'
 import { createTestDatabase, testAllocationLockPid } from '../infra/test-database.ts'
 import { testLiveKit } from '../infra/test-livekit.ts'
 import { createTestPostgresProxy } from '../infra/test-postgres-proxy.ts'
+import { createTestPostgresReadGate } from '../infra/test-postgres-read-gate.ts'
 import { createTestRoomScope } from '../infra/test-rooms.ts'
 import { clientToken } from './fixtures/client-token.ts'
 import { createLiveKitGate } from './fixtures/livekit-gate.ts'
@@ -32,9 +33,11 @@ type ResponseBody = {
   token: string
   cursor: string
   revision: string
+  generation: string
+  state: string
   capabilities: Record<string, boolean>
   participants: Participant[]
-  events: { allocationId: string; type: string }[]
+  events: { allocationId: string; type: string; revision: string }[]
 }
 
 const url = process.env.VOICE_RELAY_TEST_DATABASE_URL ?? 'postgres://voice-relay:voice-relay-test-only@127.0.0.1:17832/voice-relay'
@@ -472,4 +475,76 @@ test('an existing SID recording value survives omission until the first database
 
   expect(await status(a, { identity, sessionId: sid, micMuted: true, deafened: false })).toEqual(accepted)
   expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: sid, recording: false, micMuted: true })
+})
+
+test('a snapshot paused after its first database read can recover a concurrent HTTP end', async () => {
+  const a = await allocation()
+  const before = await call('GET', `/voice-relay/v1/allocations/${a.id}/snapshot`)
+  expect(before.body.state).toBe('active')
+  const gate = await createTestPostgresReadGate(url)
+  const reader = database.connect({ connectionString: gate.connectionString })
+  const relay = await startRelay(testLiveKit, reader.store)
+  const readerPort = (relay.server.address() as AddressInfo).port
+  const pending = call('GET', `/voice-relay/v1/allocations/${a.id}/snapshot`, undefined, 'client', readerPort)
+
+  try {
+    const firstQuery = await gate.next()
+    const ended = await call('DELETE', `/voice-relay/v1/allocations/${a.id}`)
+    expect(ended.status).toBe(200)
+    const committed = await call('GET', `/voice-relay/v1/allocations/${a.id}/snapshot`)
+    expect(committed.body.state).toBe('ended')
+
+    gate.release()
+    const snapshot = await pending
+    const feed = await call('GET', `/voice-relay/v1/events?cursor=client:${snapshot.body.revision}`)
+    const endEvents = feed.body.events.filter((event) => event.allocationId === a.id && event.type === 'ended')
+    console.info('snapshot-end evidence', JSON.stringify({ firstQuery, before, committed, snapshot, feed, endEvents }))
+
+    expect(snapshot.status).toBe(200)
+    expect(snapshot.body.generation).toBe(a.generation)
+    expect(snapshot.body.participants).toEqual([])
+    expect.soft(snapshot.body.state === 'ended' || BigInt(snapshot.body.revision) < BigInt(committed.body.revision)).toBe(true)
+    expect.soft(snapshot.body.state === 'ended' || endEvents.length === 1).toBe(true)
+    if (endEvents.length) {
+      expect(BigInt(endEvents[0].revision)).toBeGreaterThan(BigInt(snapshot.body.revision))
+      const recovered = await call('GET', `/voice-relay/v1/allocations/${a.id}/snapshot`)
+      expect(recovered.body.state).toBe('ended')
+    }
+  } finally {
+    gate.release()
+    await pending.catch(() => {})
+    await relay.close()
+    await reader.close()
+    await gate.close()
+  }
+}, 20000)
+
+test('a previous SID database marker preserves the current SID legacy recording until an explicit report', async () => {
+  const a = await allocation()
+  const identity = 'https://a.test/users/rollback'
+  const previous = await connect(a, await issue(a, identity, 'rollback'))
+  expect(await status(a, { identity, sessionId: previous.sid, micMuted: false, deafened: false, recording: true })).toEqual(accepted)
+  const leaving = replaced(previous)
+  const current = await connect(a, await issue(a, identity, 'rollback'))
+  await leaving
+  expect(current.sid).not.toBe(previous.sid)
+
+  // 이전 앱의 상태 보고 결과를 준비하는 SFU fixture이며, 전체 버전 복구 실행은 별도로 검증합니다.
+  await rooms.updateParticipant(roomName(a), identity, { attributes: { [`cherrypick.recording:${current.sid}`]: 'true' } })
+  const marker = await testParticipantRecordings(database.store, a.id)
+  expect(marker).toEqual([{ sessionId: previous.sid, recording: true }])
+  const initial = await snapshotParticipant(a, identity)
+  expect.soft(initial).toMatchObject({ sessionId: current.sid, recording: true })
+
+  expect(await status(a, { identity, sessionId: current.sid, micMuted: true, deafened: true })).toEqual(accepted)
+  const omitted = await snapshotParticipant(a, identity)
+  expect.soft(omitted).toMatchObject({ sessionId: current.sid, recording: true, micMuted: true, deafened: true })
+  expect(await testParticipantRecordings(database.store, a.id)).toEqual(marker)
+
+  expect(await status(a, { identity, sessionId: current.sid, micMuted: false, deafened: false, recording: false })).toEqual(accepted)
+  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: current.sid, recording: false })
+  expect((await liveKitParticipant(a, identity)).attributes[`cherrypick.recording:${current.sid}`]).toBe('true')
+  expect(await status(a, { identity, sessionId: current.sid, micMuted: true, deafened: false })).toEqual(accepted)
+  expect(await snapshotParticipant(a, identity)).toMatchObject({ sessionId: current.sid, recording: false, micMuted: true })
+  console.info('snapshot-legacy evidence', JSON.stringify({ previousSid: previous.sid, currentSid: current.sid, marker, initial, omitted }))
 })
